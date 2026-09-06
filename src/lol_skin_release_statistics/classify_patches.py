@@ -1,4 +1,4 @@
-"""Classify normalized patch entries through a LiteLLM proxy."""
+"""Classify aggregate champion-patch notes through a LiteLLM proxy."""
 
 from __future__ import annotations
 
@@ -52,7 +52,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument('--patch', action='append', help='Classify only this patch ID; repeat for multiple patches.')
     volume = parser.add_mutually_exclusive_group()
-    volume.add_argument('--limit', type=_positive_int, help='Maximum number of entries to classify in this run.')
+    volume.add_argument('--limit', type=_positive_int, help='Maximum number of champion-patches to classify in this run.')
     volume.add_argument(
         '--all',
         action='store_true',
@@ -79,7 +79,7 @@ def build_parser() -> argparse.ArgumentParser:
         action='store_true',
         help='Show candidate inputs without calling LiteLLM or changing classifications.',
     )
-    parser.add_argument('--verbose', action='store_true', help='Log every classified entry.')
+    parser.add_argument('--verbose', action='store_true', help='Log every classified champion-patch.')
     return parser
 
 
@@ -135,18 +135,19 @@ def _classify_candidates(
 ) -> None:
     total = len(candidates)
     if total == 0:
-        LOGGER.info('No patch entries require classification.')
+        LOGGER.info('No champion-patches require classification.')
         return
-    LOGGER.info('Classifying %d patch entries with %d worker processes', total, workers)
+    LOGGER.info('Classifying %d champion-patches with %d worker processes', total, workers)
     tasks = ((candidate, worker_config) for candidate in candidates)
     with get_context('spawn').Pool(processes=workers) as pool:
         results = pool.imap_unordered(_classify_candidate, tasks, chunksize=1)
-        for entry_id, result in tqdm(results, total=total, desc='Classifying', unit='entry'):
-            database.save_classification(entry_id, result)
+        for candidate, result in tqdm(results, total=total, desc='Classifying', unit='champion-patch'):
+            database.save_patch_classification(candidate.champion_id, candidate.patch_id, result)
             if verbose:
                 LOGGER.info(
-                    'Classified entry=%d label=%s confidence=%s',
-                    entry_id,
+                    'Classified champion=%s patch=%s label=%s confidence=%s',
+                    candidate.champion_name,
+                    candidate.patch_id,
                     result.label,
                     result.confidence,
                 )
@@ -154,11 +155,11 @@ def _classify_candidates(
 
 def _classify_candidate(
     task: tuple[ClassificationCandidate, _WorkerConfig],
-) -> tuple[int, ClassificationResult]:
+) -> tuple[ClassificationCandidate, ClassificationResult]:
     """Classify one task inside a worker process."""
     candidate, worker_config = task
     result = _worker_client(worker_config).classify(candidate)
-    return candidate.entry_id, result
+    return candidate, result
 
 
 @lru_cache(maxsize=1)
@@ -176,9 +177,14 @@ def _worker_client(config: _WorkerConfig) -> LiteLLMClient:
 
 
 def _log_dry_run(candidates: Sequence[ClassificationCandidate]) -> None:
-    LOGGER.info('Dry run: %d candidate entries', len(candidates))
+    LOGGER.info('Dry run: %d candidate champion-patches', len(candidates))
     for candidate in candidates:
-        LOGGER.info('entry=%s input=%s', candidate.entry_id, classification_input_json(candidate))
+        LOGGER.info(
+            'champion=%s patch=%s input=%s',
+            candidate.champion_name,
+            candidate.patch_id,
+            classification_input_json(candidate),
+        )
 
 
 def _environment_value(name: str, required: bool = True) -> str:

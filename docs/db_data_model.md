@@ -102,9 +102,10 @@ erDiagram
         int source_order UK
     }
 
-    CLASSIFICATIONS {
+    PATCH_CLASSIFICATIONS {
         int id PK
-        int patch_entry_id FK, UK
+        int champion_id FK, UK
+        string patch_id FK, UK
         string label
         string confidence
         string classified_at
@@ -118,7 +119,8 @@ erDiagram
     CHAMPIONS ||--o{ PATCH_EVENTS : "has history"
     PATCHES ||--o{ PATCH_EVENTS : "groups"
     PATCH_EVENTS ||--o{ PATCH_ENTRIES : "contains"
-    PATCH_ENTRIES ||--o| CLASSIFICATIONS : "may have"
+    CHAMPIONS ||--o{ PATCH_CLASSIFICATIONS : "has aggregate patch labels"
+    PATCHES ||--o{ PATCH_CLASSIFICATIONS : "has aggregate champion labels"
 ```
 
 `source_documents` is deliberately standalone: its `source_type` and `source_key` identify the cached raw API document without coupling normalized rows to a particular snapshot. Composite uniqueness constraints are shown as `UK` on their participating fields.

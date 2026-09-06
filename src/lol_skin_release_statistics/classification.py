@@ -1,4 +1,4 @@
-"""LiteLLM client and prompt contract for patch-entry classification."""
+"""LiteLLM client and prompt contract for champion-patch classification."""
 
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ LOGGER = logging.getLogger(__name__)
 _RETRYABLE_STATUS_CODES = frozenset({408, 409, 429, 500, 502, 503, 504})
 _JSON_FENCE = re.compile(r'^```(?:json)?\s*(?P<body>.*?)\s*```$', re.DOTALL | re.IGNORECASE)
 
-SYSTEM_PROMPT = """You classify one normalized League of Legends champion patch-history entry.
+SYSTEM_PROMPT = """You classify the overall effect of all supplied League of Legends patch notes for one champion in one patch.
 
 Return one JSON object with exactly these fields:
 - "label": one of "buff", "nerf", "change", or "rework"
@@ -31,13 +31,13 @@ Definitions:
 - nerf: decreases the champion's power, consistency, availability, or usability.
 - change: neutral or mixed mechanical work, compensation with no clear direction, presentation/audio/text work,
   or a bug fix without a clear power direction.
-- rework: the target entry belongs to an explicit, broad champion gameplay overhaul or relaunch that
+- rework: the supplied patch notes belong to an explicit, broad champion gameplay overhaul or relaunch that
   substantially replaces mechanics across the kit.
 
 Use rework conservatively. Do not infer it merely from a large number of balance changes, a champion's initial
-release, a visual update, a bug-fix patch, or a small/mid-scope adjustment. When the supplied context is not enough
-to establish a rework, classify the target entry by its direct effect. Classify only target_change; the event-level
-fields are supporting context.
+release, a visual update, a bug-fix patch, or a small/mid-scope adjustment. Consider every supplied event and entry
+together. If the notes contain material buffs and nerfs with no clear overall direction, classify them as change.
+Classify the aggregate patch effect, not any individual entry.
 
 Confidence describes how certain you are that the selected label is correct, not the size or gameplay impact of the
 change:
@@ -65,19 +65,30 @@ class _RetryableClassificationError(ClassificationError):
 
 @dataclass(frozen=True)
 class ClassificationCandidate:
-    """One database patch entry plus enough event context for classification."""
+    """All normalized notes for one champion in one patch."""
 
-    entry_id: int
-    event_id: int
+    champion_id: int
     champion_name: str
     patch_id: str
-    patch_heading: str
     patch_release_date: str | None
+    events: tuple['PatchClassificationEvent', ...]
+
+
+@dataclass(frozen=True)
+class PatchClassificationEvent:
+    """One heading and its leaf notes in a champion-patch candidate."""
+
+    heading: str
     effective_date: str | None
+    entries: tuple['PatchClassificationEntry', ...]
+
+
+@dataclass(frozen=True)
+class PatchClassificationEntry:
+    """One normalized patch-history leaf note."""
+
     context: str
     change_text: str
-    event_entry_count: int
-    event_contexts: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -217,19 +228,22 @@ class LiteLLMClient:
 
 
 def classification_input_json(candidate: ClassificationCandidate) -> str:
-    """Serialize the stable entry input supplied to the model."""
+    """Serialize the stable champion-patch input supplied to the model."""
     data = {
         'champion': candidate.champion_name,
-        'event_contexts': candidate.event_contexts,
-        'event_entry_count': candidate.event_entry_count,
-        'patch_effective_date': candidate.effective_date,
-        'patch_heading': candidate.patch_heading,
         'patch_id': candidate.patch_id,
         'patch_release_date': candidate.patch_release_date,
-        'target_change': {
-            'context': candidate.context,
-            'text': candidate.change_text,
-        },
+        'patch_notes': [
+            {
+                'effective_date': event.effective_date,
+                'entries': [
+                    {'context': entry.context, 'text': entry.change_text}
+                    for entry in event.entries
+                ],
+                'heading': event.heading,
+            }
+            for event in candidate.events
+        ],
     }
     return json.dumps(data, ensure_ascii=False, separators=(',', ':'), sort_keys=True)
 

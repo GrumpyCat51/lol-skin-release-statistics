@@ -26,6 +26,49 @@ extensions before running a collector or classifier. SQLite cannot safely coordi
 Windows process that keeps the database's journal files open. The application uses SQLite's rollback journal for
 compatibility with this setup.
 
+## Clean, complete rebuild
+
+Run these steps sequentially from the repository root to build a new database. The reset command permanently removes
+the current database and its SQLite journal sidecars; do not run it if you need to retain the current data.
+
+```bash
+rm -f \
+  data/lol_skin_release_statistics.sqlite3 \
+  data/lol_skin_release_statistics.sqlite3-journal \
+  data/lol_skin_release_statistics.sqlite3-shm \
+  data/lol_skin_release_statistics.sqlite3-wal
+
+collect-lol-wiki \
+  --database data/lol_skin_release_statistics.sqlite3 \
+  --user-agent "lol-skin-release-statistics/0.1 (your-email@example.com)"
+```
+
+League of Graphs pages must be saved manually because this project intentionally has no automated downloader. Put
+the saved `.htm` files under `data/leagueofgraphs_html_pages`, then import them:
+
+```bash
+import-leagueofgraphs-html \
+  --input-dir data/leagueofgraphs_html_pages \
+  --database data/lol_skin_release_statistics.sqlite3
+```
+
+Finally configure LiteLLM and classify every champion-patch:
+
+```bash
+export LITELLM_KEY="your-api-key"
+export LITELLM_URL="https://litellm.example.com/v1"
+export LITELLM_MODEL="your-model-name"
+
+classify-lol-patches \
+  --database data/lol_skin_release_statistics.sqlite3 \
+  --all \
+  --workers 6
+```
+
+The Wiki collector is the only source-data network fetch in this sequence; LiteLLM separately makes classification
+requests. The offline League of Graphs importer and LiteLLM classifier write to the same database, so do not run
+them concurrently.
+
 ## League Wiki collector
 
 The installed `collect-lol-wiki` command collects:
@@ -87,7 +130,7 @@ The import is transactional and replaces the normalized rows for each refreshed 
 | `patches` | Patch identifiers, Wiki titles/URLs, and release dates |
 | `patch_events` | Champion-specific patch/hotfix headings and effective dates |
 | `patch_entries` | Individual changes with their ability/stat context and source order |
-| `classifications` | Shareable label, worded confidence, and timestamp for each patch entry |
+| `patch_classifications` | Shareable label, worded confidence, and timestamp for each champion-patch |
 
 See the [database entity-relationship diagram](db_data_model.md) for all implemented fields and relationships.
 
@@ -105,9 +148,9 @@ sqlite3 -header -column data/lol_skin_release_statistics.sqlite3 \
    WHERE c.name = 'Ashe' ORDER BY s.release_date;"
 ```
 
-## Patch-entry classification
+## Champion-patch classification
 
-The `classify-lol-patches` command sends one normalized `patch_entries` row per request to an OpenAI-compatible LiteLLM proxy. It classifies each entry as `buff`, `nerf`, `change`, or `rework` and stores the validated response separately in `classifications`.
+The `classify-lol-patches` command sends all normalized `patch_events` and `patch_entries` for one champion and patch ID per request to an OpenAI-compatible LiteLLM proxy. It classifies their overall effect as `buff`, `nerf`, `change`, or `rework` and stores the validated response in `patch_classifications`.
 
 Configure the endpoint using environment variables; credentials are never written to the database:
 
@@ -131,11 +174,9 @@ Then run a small paid/requested sample and review the results before starting th
 classify-lol-patches --champion Ashe --limit 10
 
 sqlite3 -header -column data/lol_skin_release_statistics.sqlite3 \
-  "SELECT c.name, pe.change_text, cl.label, cl.confidence
-   FROM classifications AS cl
-   JOIN patch_entries AS pe ON pe.id = cl.patch_entry_id
-   JOIN patch_events AS event ON event.id = pe.patch_event_id
-   JOIN champions AS c ON c.id = event.champion_id
+  "SELECT c.name, cl.patch_id, cl.label, cl.confidence
+   FROM patch_classifications AS cl
+   JOIN champions AS c ON c.id = cl.champion_id
    ORDER BY cl.id DESC LIMIT 10;"
 ```
 
@@ -162,7 +203,7 @@ capacity and rate limits of the endpoint:
 classify-lol-patches --all --workers 6
 ```
 
-The explicit `--all` flag prevents accidentally starting tens of thousands of model requests; the current Wiki snapshot contains roughly 34,000 individual entries. A `tqdm` progress bar reports completed entries, elapsed time, throughput, and estimated time remaining.
+The explicit `--all` flag prevents accidentally starting a large batch of model requests. A `tqdm` progress bar reports completed champion-patches, elapsed time, throughput, and estimated time remaining.
 
 Useful controls are:
 
@@ -172,15 +213,15 @@ Useful controls are:
 - `--delay SECONDS`, `--timeout SECONDS`, and `--retries N` for endpoint behavior;
 - `--no-verify-ssl` to explicitly disable certificate and hostname verification;
 - `--force` to replace existing results in the selected scope;
-- `--verbose` to report every classified entry.
+- `--verbose` to report every classified champion-patch.
 
-Each successful response is committed immediately by the parent process. If the process is interrupted, rerunning the command skips entries that already have a classification. Use `--force` when intentionally replacing them, including when changing models or prompts. Responses are locally validated before insertion, and transient HTTP errors, rate limits, malformed JSON, and invalid labels are retried. `--delay` applies independently within each worker, so reduce `--workers` as well when enforcing a low aggregate request rate.
+Each successful response is committed immediately by the parent process. If the process is interrupted, rerunning the command skips champion-patches that already have a classification. Use `--force` when intentionally replacing them, including when changing models or prompts. Responses are locally validated before insertion, and transient HTTP errors, rate limits, malformed JSON, and invalid labels are retried. `--delay` applies independently within each worker, so reduce `--workers` as well when enforcing a low aggregate request rate.
 
 Only the label, worded confidence, and classification timestamp are stored. Confidence is one of `VERY_UNCERTAIN`, `UNCERTAIN`, `AMBIGUOUS`, `CERTAIN`, or `VERY_CERTAIN`. The LiteLLM URL, model name, API key, prompt, request metadata, token usage, and raw model response are not written to SQLite, keeping the database suitable for sharing.
 
-Reimporting an unchanged cached Wiki history preserves its entry IDs and classifications. If a refreshed Wiki history has actually changed, classifications for that champion are removed through the database relationship and must be generated again; this prevents labels from remaining attached to stale text.
+Reimporting an unchanged cached Wiki history preserves its classifications. If a refreshed Wiki history has actually changed, champion-patch classifications for that champion are removed and must be generated again; this prevents labels from remaining attached to stale text.
 
-The model receives the target entry plus its champion, patch heading/date, number of sibling entries, and the event's affected contexts. The prompt defines `rework` conservatively so large ordinary balance patches and initial champion releases are not mislabeled solely because they contain many changes. Classification quality should still be evaluated on a manually reviewed sample before downstream analysis.
+The model receives every patch heading and leaf entry for the champion-patch, including hotfix headings and effective dates. The prompt defines `rework` conservatively so large ordinary balance patches and initial champion releases are not mislabeled solely because they contain many changes. Classification quality should still be evaluated on a manually reviewed sample before downstream analysis.
 
 ## League of Graphs HTML import
 

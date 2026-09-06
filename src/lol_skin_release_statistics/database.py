@@ -12,7 +12,12 @@ from urllib.parse import quote
 
 from typing_extensions import Self
 
-from lol_skin_release_statistics.classification import ClassificationCandidate, ClassificationResult
+from lol_skin_release_statistics.classification import (
+    ClassificationCandidate,
+    ClassificationResult,
+    PatchClassificationEntry,
+    PatchClassificationEvent,
+)
 from lol_skin_release_statistics.wiki import Champion, PatchEvent, Skin, parse_hotfix_date, wiki_page_url
 
 if TYPE_CHECKING:
@@ -132,20 +137,22 @@ CREATE TABLE IF NOT EXISTS patch_entries (
     UNIQUE (patch_event_id, source_order)
 );
 
-CREATE TABLE IF NOT EXISTS classifications (
+CREATE TABLE IF NOT EXISTS patch_classifications (
     id INTEGER PRIMARY KEY,
-    patch_entry_id INTEGER NOT NULL UNIQUE REFERENCES patch_entries(id) ON DELETE CASCADE,
+    champion_id INTEGER NOT NULL REFERENCES champions(id) ON DELETE CASCADE,
+    patch_id TEXT NOT NULL REFERENCES patches(patch_id),
     label TEXT NOT NULL CHECK (label IN ('buff', 'nerf', 'change', 'rework')),
     confidence TEXT NOT NULL CHECK (
         confidence IN ('VERY_UNCERTAIN', 'UNCERTAIN', 'AMBIGUOUS', 'CERTAIN', 'VERY_CERTAIN')
     ),
-    classified_at TEXT NOT NULL
+    classified_at TEXT NOT NULL,
+    UNIQUE (champion_id, patch_id)
 );
 
 CREATE INDEX IF NOT EXISTS patch_events_patch_id_idx ON patch_events(patch_id);
 CREATE INDEX IF NOT EXISTS skins_release_date_idx ON skins(release_date);
 CREATE INDEX IF NOT EXISTS skin_chromas_wiki_id_idx ON skin_chromas(skin_id, wiki_chroma_id);
-CREATE INDEX IF NOT EXISTS classifications_label_idx ON classifications(label);
+CREATE INDEX IF NOT EXISTS patch_classifications_label_idx ON patch_classifications(label);
 CREATE INDEX IF NOT EXISTS graph_points_observed_at_idx ON graph_points(observed_at_ms);
 """
 
@@ -161,7 +168,7 @@ class Database:
         self.connection.row_factory = sqlite3.Row
         self.connection.execute('PRAGMA foreign_keys = ON')
         self.connection.executescript(SCHEMA)
-        self._migrate_classifications()
+        self._migrate_legacy_classifications()
 
     def close(self) -> None:
         """Close the SQLite connection."""
@@ -399,6 +406,9 @@ class Database:
         if self._patch_history_matches(champion_id, events):
             return
         with self.transaction():
+            # A champion history refresh can revise any patch's notes. Existing aggregate labels
+            # are no longer auditable against those notes, so they must be regenerated.
+            self.connection.execute('DELETE FROM patch_classifications WHERE champion_id = ?', (champion_id,))
             self.connection.execute('DELETE FROM patch_events WHERE champion_id = ?', (champion_id,))
             for event in events:
                 self.connection.execute(
@@ -476,15 +486,16 @@ class Database:
         limit: int | None = None,
         force: bool = False,
     ) -> list[ClassificationCandidate]:
-        """Return filtered entries that still require classification."""
+        """Return filtered champion-patch notes that still require classification."""
         conditions: list[str] = []
         parameters: list[object] = []
         if not force:
             conditions.append(
                 """
                 NOT EXISTS (
-                    SELECT 1 FROM classifications classification
-                    WHERE classification.patch_entry_id = patch_entries.id
+                    SELECT 1 FROM patch_classifications classification
+                    WHERE classification.champion_id = patch_events.champion_id
+                      AND classification.patch_id = patch_events.patch_id
                 )
                 """,
             )
@@ -497,65 +508,48 @@ class Database:
             conditions.append(f'patches.patch_id IN ({placeholders})')
             parameters.extend(patch_ids)
         where_clause = f'WHERE {" AND ".join(conditions)}' if conditions else ''
-        limit_clause = 'LIMIT ?' if limit is not None else ''
-        if limit is not None:
-            parameters.append(limit)
         query = f"""
             SELECT
-                patch_entries.id AS entry_id,
-                patch_events.id AS event_id,
+                champions.id AS champion_id,
                 champions.name AS champion_name,
                 patches.patch_id,
+                patch_events.id AS event_id,
                 patch_events.heading AS patch_heading,
                 patches.release_date AS patch_release_date,
                 patch_events.effective_date,
                 patch_entries.context,
-                patch_entries.change_text,
-                (
-                    SELECT COUNT(*) FROM patch_entries event_entry
-                    WHERE event_entry.patch_event_id = patch_events.id
-                ) AS event_entry_count
+                patch_entries.change_text
             FROM patch_entries
             JOIN patch_events ON patch_events.id = patch_entries.patch_event_id
             JOIN patches ON patches.patch_id = patch_events.patch_id
             JOIN champions ON champions.id = patch_events.champion_id
             {where_clause}
-            ORDER BY champions.name, patch_events.source_order, patch_entries.source_order
-            {limit_clause}
+            ORDER BY champions.name, patches.patch_id, patch_events.source_order, patch_entries.source_order
             """  # noqa: S608 - fragments are internally generated; values remain bound parameters.
         rows = self.connection.execute(query, parameters).fetchall()
-        contexts = self._event_contexts({int(row['event_id']) for row in rows})
-        return [
-            ClassificationCandidate(
-                entry_id=int(row['entry_id']),
-                event_id=int(row['event_id']),
-                champion_name=str(row['champion_name']),
-                patch_id=str(row['patch_id']),
-                patch_heading=str(row['patch_heading']),
-                patch_release_date=_optional_row_string(row['patch_release_date']),
-                effective_date=_optional_row_string(row['effective_date']),
-                context=str(row['context']),
-                change_text=str(row['change_text']),
-                event_entry_count=int(row['event_entry_count']),
-                event_contexts=contexts.get(int(row['event_id']), ()),
-            )
-            for row in rows
-        ]
+        candidates = self._patch_classification_candidates(rows)
+        return candidates[:limit] if limit is not None else candidates
 
-    def save_classification(self, entry_id: int, result: ClassificationResult) -> None:
-        """Insert or replace one classification and commit it immediately."""
+    def save_patch_classification(
+        self,
+        champion_id: int,
+        patch_id: str,
+        result: ClassificationResult,
+    ) -> None:
+        """Insert or replace one champion-patch classification and commit it immediately."""
         self.connection.execute(
             """
-            INSERT INTO classifications (
-                patch_entry_id, label, confidence, classified_at
-            ) VALUES (?, ?, ?, ?)
-            ON CONFLICT (patch_entry_id) DO UPDATE SET
+            INSERT INTO patch_classifications (
+                champion_id, patch_id, label, confidence, classified_at
+            ) VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT (champion_id, patch_id) DO UPDATE SET
                 label = excluded.label,
                 confidence = excluded.confidence,
                 classified_at = excluded.classified_at
             """,
             (
-                entry_id,
+                champion_id,
+                patch_id,
                 result.label,
                 result.confidence,
                 result.classified_at,
@@ -564,11 +558,11 @@ class Database:
         self.connection.commit()
 
     def classification_counts(self) -> dict[str, int]:
-        """Count all stored classification labels."""
+        """Count all stored champion-patch classification labels."""
         rows = self.connection.execute(
             """
             SELECT label, COUNT(*) AS count
-            FROM classifications
+            FROM patch_classifications
             GROUP BY label
             """,
         ).fetchall()
@@ -585,7 +579,7 @@ class Database:
             'patches',
             'patch_events',
             'patch_entries',
-            'classifications',
+            'patch_classifications',
         )
         return {
             table: int(self.connection.execute(f'SELECT COUNT(*) FROM {table}').fetchone()[0])  # noqa: S608
@@ -627,29 +621,61 @@ class Database:
         rows = self.connection.execute('SELECT name, wiki_data_name FROM champions').fetchall()
         return {str(row['name']): str(row['wiki_data_name']) for row in rows}
 
-    def _event_contexts(self, event_ids: set[int]) -> dict[int, tuple[str, ...]]:
-        if not event_ids:
-            return {}
-        rows = self.connection.execute(
-            """
-            SELECT patch_event_id, context
-            FROM patch_entries
-            WHERE context <> ''
-            GROUP BY patch_event_id, context
-            ORDER BY patch_event_id, MIN(source_order)
-            """,
-        ).fetchall()
-        contexts: dict[int, list[str]] = {}
+    def _patch_classification_candidates(self, rows: Sequence[sqlite3.Row]) -> list[ClassificationCandidate]:
+        """Group ordered patch-entry rows into one model request per champion-patch."""
+        grouped: dict[tuple[int, str], dict[str, object]] = {}
         for row in rows:
-            event_id = int(row['patch_event_id'])
-            if event_id in event_ids:
-                contexts.setdefault(event_id, []).append(str(row['context']))
-        return {event_id: tuple(values) for event_id, values in contexts.items()}
+            key = (int(row['champion_id']), str(row['patch_id']))
+            candidate = grouped.setdefault(
+                key,
+                {
+                    'champion_name': str(row['champion_name']),
+                    'patch_release_date': _optional_row_string(row['patch_release_date']),
+                    'events': [],
+                },
+            )
+            events = candidate['events']
+            assert isinstance(events, list)
+            heading = str(row['patch_heading'])
+            effective_date = _optional_row_string(row['effective_date'])
+            event_id = int(row['event_id'])
+            if not events or events[-1]['id'] != event_id:
+                events.append({'id': event_id, 'heading': heading, 'effective_date': effective_date, 'entries': []})
+            entries = events[-1]['entries']
+            assert isinstance(entries, list)
+            entries.append(
+                PatchClassificationEntry(context=str(row['context']), change_text=str(row['change_text'])),
+            )
 
-    def _migrate_classifications(self) -> None:
-        """Replace the earlier numeric-confidence table without losing classifications."""
+        candidates: list[ClassificationCandidate] = []
+        for (champion_id, patch_id), candidate in grouped.items():
+            event_data = candidate['events']
+            assert isinstance(event_data, list)
+            events = tuple(
+                PatchClassificationEvent(
+                    heading=str(event['heading']),
+                    effective_date=event['effective_date'],
+                    entries=tuple(event['entries']),
+                )
+                for event in event_data
+            )
+            candidates.append(
+                ClassificationCandidate(
+                    champion_id=champion_id,
+                    champion_name=str(candidate['champion_name']),
+                    patch_id=patch_id,
+                    patch_release_date=candidate['patch_release_date'],
+                    events=events,
+                ),
+            )
+        return candidates
+
+    def _migrate_legacy_classifications(self) -> None:
+        """Normalize the old entry-level table's confidence values when it exists."""
         columns = self.connection.execute('PRAGMA table_info(classifications)').fetchall()
         column_names = tuple(str(row['name']) for row in columns)
+        if not column_names:
+            return
         expected = ('id', 'patch_entry_id', 'label', 'confidence', 'classified_at')
         if column_names == expected:
             return

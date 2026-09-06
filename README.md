@@ -13,12 +13,12 @@ Collect the following data for every League of Legends champion:
    - win rate;
    - popularity/pick rate;
    - ban rate;
-   - the timestamp and filter configuration associated with every point.
+   - the timestamp associated with every point.
 
 2. Every skin and its release date from the champion's Wiki [Cosmetics page](https://wiki.leagueoflegends.com/en-us/Ashe/Cosmetics).
 3. The champion's complete [League of Legends Wiki](https://wiki.leagueoflegends.com/en-us/Ashe/Patch_history) patch history.
 4. The release/effective date of every referenced patch and hotfix.
-5. A classification of each individual patch-history entry as a `buff`, `nerf`, `change`, or `rework`.
+5. One classification of each champion's overall change in a patch as a `buff`, `nerf`, `change`, or `rework`.
 
 ## Proposed pipeline
 
@@ -33,7 +33,7 @@ canonical champion registry + source-specific aliases/URLs
         └── Wiki patch histories ─────► patch entries + patch dates     │
                                                     │                   │
                                                     ▼                   │
-                                  LiteLLM structured classification ────┤
+                         champion-patch LiteLLM classification ────┤
                                                                         ▼
                                                                  local SQLite DB
 ```
@@ -53,7 +53,9 @@ The database should keep a stable internal champion ID alongside the display nam
 
 League of Graphs' champion stats pages render the historical charts from JavaScript arrays of `[Unix timestamp in milliseconds, value]` pairs. Separate arrays exist for popularity, win rate, and ban rate. The data is therefore more precise than reading pixels or chart tooltips.
 
-Each series must retain the filters that produced it, including champion, role, rank bracket, region, queue/game mode, and source URL. The timestamps are observations rather than patch identifiers, so they should be stored as-is and joined to the patch calendar later.
+Each series must retain the champion identity and source provenance, including the source URL and saved HTML file.
+Role, rank bracket, region, queue, and game-mode filters are intentionally not normalized or stored. The timestamps
+are observations rather than patch identifiers, so they should be stored as-is and joined to the patch calendar later.
 
 #### Access constraint
 
@@ -96,18 +98,18 @@ A patch history is already structured as patch heading → ability/stat context 
 
 Raw source text should be retained. The parser can then be improved without refetching the source, and every normalized entry remains auditable.
 
-### 5. Classify balance changes
+### 5. Classify champion-patch balance changes
 
-Send individual normalized entries—not whole champion histories—to the configured model through LiteLLM and request a strict structured response with one label:
+Send all normalized patch notes for one champion and patch—not a whole champion history—to the configured model through LiteLLM and request a strict structured response with one label:
 
 - `buff`: increases the champion's power or usability;
 - `nerf`: decreases the champion's power or usability;
 - `change`: neutral, mixed, mechanical, cosmetic, or bug-fix-only change;
 - `rework`: belongs to an explicit, broad champion gameplay overhaul or relaunch that substantially replaces mechanics across the kit.
 
-Use `rework` conservatively. A large ordinary balance patch, initial champion release, visual update, or smaller mid-scope adjustment is not automatically a rework. The classifier should receive the patch heading, event size, and affected ability/stat contexts alongside the target entry so it can identify genuine rework events without classifying a whole champion history at once.
+Use `rework` conservatively. A large ordinary balance patch, initial champion release, visual update, or smaller mid-scope adjustment is not automatically a rework. The classifier receives every patch heading, hotfix, ability/stat context, and individual change for the champion-patch, then judges their aggregate effect. Material buffs and nerfs with no clear net direction are classified as `change`.
 
-Keep classification output separate from the extracted fact. The shared database only needs the label, worded confidence, and classification time. LiteLLM connection details, model identifiers, prompts, request metadata, and raw responses remain process-only and are not persisted. Patch-level labels should be derived from the individual entries because one patch can contain buffs, nerfs, and neutral changes together.
+Keep classification output separate from the extracted fact. The shared database only needs the label, worded confidence, and classification time. LiteLLM connection details, model identifiers, prompts, request metadata, and raw responses remain process-only and are not persisted.
 
 Classification runs through 12 worker processes by default and displays a `tqdm` progress bar. Workers perform only
 the LiteLLM requests; the parent process serializes SQLite writes so interrupted runs remain safely resumable.
@@ -126,7 +128,7 @@ The normalized database will live locally, for example at `data/lol_skin_release
 | `patches` | Patch identifier, release date, and source URL |
 | `patch_events` | Champion-specific patch/hotfix headings, effective dates, and source order |
 | `patch_entries` | Champion, patch, context, individual change text, and source order |
-| `classifications` | Shareable classification label, worded confidence, and timestamp for each patch entry |
+| `patch_classifications` | Shareable classification label, worded confidence, and timestamp for each champion-patch |
 | `skins` | Skin ID/name, base-skin flag, release/retirement dates, availability, price, and source URLs |
 | `skin_chromas` | Chroma IDs and availability, linked to their base skin |
 
