@@ -38,7 +38,7 @@ article; the R code that constructs tables, tests, and figures is hidden from th
 #| label: analysis-parameters
 #| echo: true
 #| eval: false
-skin_release_cutoff_year <- 2013L
+skin_release_cutoff_year <- 2014L
 skin_patch_window_days <- 42L
 champion_release_window_days <- 60L
 rework_window_days <- 60L
@@ -46,10 +46,11 @@ pre_performance_days <- 28L
 post_performance_days <- 14L
 ```
 
-A skin is eligible when it was released in 2013 or later and is not within 60 days of either the champion's original
-release or a classified rework. Patch-note windows extend 42 days in both directions from an eligible skin release.
-Performance changes are measured as the interpolated value 14 days after an anchor minus the value 28 days before it.
-All rate changes are reported in percentage points.
+A skin is eligible when it was released in 2014 or later and is not within 60 days of either the champion's original
+release or a classified rework. The cutoff aligns the analysis with the start of the stored League of Graphs
+performance histories in March 2014. Patch-note windows extend 42 days in both directions from an eligible skin
+release. Performance changes are measured as the interpolated value 14 days after an anchor minus the value 28 days
+before it. All rate changes are reported in percentage points.
 
 The unit of the patch-note analysis is a champion–patch opportunity: every champion available on a patch date either
 appears in that patch's notes or does not. The unit of the balance analysis is one aggregate classification for a
@@ -146,8 +147,8 @@ warning about confounding: commercially prominent champions recur throughout the
 
 ```{r}
 #| label: leading-champions-table
-#| tbl-cap: "Champions with the most dated non-base skin releases (top 10 by overall count)."
-leading_champions <- head(copy(top_20_champions_by_skin_releases), 10L)
+#| tbl-cap: "Champions with the most dated non-base skin releases (top 20 by overall count)."
+leading_champions <- head(copy(top_20_champions_by_skin_releases), 20L)
 setnames(
   leading_champions,
   c("champion_id", "champion_name", "overall_skin_releases", "skins_since_cutoff"),
@@ -155,6 +156,71 @@ setnames(
 )
 knitr::kable(leading_champions, format.args = list(big.mark = ","))
 ```
+
+### Pricing coverage
+
+Exact, published RP price bands provide a transparent first-pass skin-tier variable. The mapping uses 520 RP as
+Basic, 750 as Deluxe, 975 as Standard, 1,350 as Epic, 1,820 as Legendary, and 2,775/3,250 as Ultimate; the small
+legacy 390 RP group is retained separately. Costs outside those exact bands, including missing values and special
+currency values, are not forced into an RP tier. These band definitions follow the [League Wiki's pricing
+table](https://leagueoflegends.fandom.com/wiki/Champion_skin#Pricing).
+
+```{r}
+#| label: skin-price-tier-table
+#| tbl-cap: "Eligible skin releases by recognized RP price band."
+price_tier_display <- copy(skin_price_tier_counts)
+setnames(
+  price_tier_display,
+  c("price_category", "eligible_skin_releases", "champions"),
+  c("Price category", "Eligible skin releases", "Champions")
+)
+knitr::kable(price_tier_display, format.args = list(big.mark = ","))
+```
+
+```{r}
+#| label: skin-price-tier-by-year-figure
+#| fig-cap: "Dated skin releases from the analysis cutoff onward, by exact RP price band and release year."
+#| fig-width: 10
+#| fig-height: 6
+price_categories <- c(rp_price_tier_levels, "Non-standard or missing price")
+price_tier_years <- dcast(
+  skin_price_tier_releases_by_year,
+  release_year ~ price_category,
+  value.var = "skin_releases",
+  fill = 0L
+)
+for (price_category in price_categories) {
+  if (!price_category %in% names(price_tier_years)) {
+    price_tier_years[, (price_category) := 0L]
+  }
+}
+setcolorder(price_tier_years, c("release_year", price_categories))
+price_colours <- grDevices::hcl.colors(length(price_categories), "Dark 3")
+matplot(
+  price_tier_years$release_year,
+  as.matrix(price_tier_years[, ..price_categories]),
+  type = "b",
+  pch = seq_along(price_categories),
+  lty = 1,
+  col = price_colours,
+  xlab = "Release year",
+  ylab = "Skin releases",
+  main = "Skin releases by recognized RP price band"
+)
+legend(
+  "topleft",
+  legend = price_categories,
+  col = price_colours,
+  pch = seq_along(price_categories),
+  lty = 1,
+  cex = 0.75,
+  bty = "n"
+)
+```
+
+This makes a tier-stratified analysis feasible, but not yet sufficient for a causal claim: price is also related to
+release era, availability, and whether the skin is part of a major event. Those factors should be kept explicit when
+comparing tiers.
 
 ## Finding 1: skin releases coincide with more patch-note attention
 
@@ -274,20 +340,23 @@ knitr::kable(performance_delta_display, digits = 3, format.args = list(big.mark 
 
 The yearly distributions tell the same broad story. Win-rate changes cluster around zero for both groups. Pick- and
 ban-rate changes are more dispersed, but skin releases tend to sit higher than the comparison population. Outlying
-points are suppressed in the figure so that the central distributions remain legible; they remain in every
+points are suppressed in the figures so that the central distributions remain legible; they remain in every
 calculation.
 
 ```{r}
-#| label: performance-delta-boxplots
-#| fig-cap: "Distributions of after-minus-before changes by anchor year. Grey boxes are the general population; colored boxes are eligible skin releases."
-#| fig-width: 16
-#| fig-height: 6.5
-plot_compact_delta_panel <- function(metric_label, colour) {
+#| label: performance-delta-boxplot-setup
+#| include: false
+plot_delta_boxplot_by_year <- function(metric_label, colour) {
   plot_data <- performance_deltas_long[metric == metric_label]
-  years <- sort(unique(plot_data$anchor_year))
+  years <- seq.int(skin_release_cutoff_year, max(plot_data$anchor_year))
+  observed_years <- sort(unique(plot_data$anchor_year))
   year_positions <- seq_along(years)
-  box_positions <- as.vector(rbind(year_positions - 0.18, year_positions + 0.18))
-  box_values <- unlist(lapply(years, function(year) {
+  observed_positions <- match(observed_years, years)
+  box_positions <- as.vector(rbind(
+    observed_positions - 0.18,
+    observed_positions + 0.18
+  ))
+  box_values <- unlist(lapply(observed_years, function(year) {
     list(
       plot_data[
         anchor_year == year & comparison_group == "General population",
@@ -308,20 +377,64 @@ plot_compact_delta_panel <- function(metric_label, colour) {
     border = "grey35",
     outline = FALSE,
     xaxt = "n",
+    xlim = c(0.5, length(years) + 0.5),
     xlab = "Anchor year",
     ylab = "Change (pp)",
-    main = metric_label
+    main = sprintf("%s change by anchor year", metric_label),
+    cex.axis = 1,
+    cex.lab = 1.15,
+    cex.main = 1.2
   )
-  axis(1, at = year_positions, labels = years, las = 2, cex.axis = 0.75)
+  axis(1, at = year_positions, labels = years, las = 2, cex.axis = 0.95)
   abline(h = 0, lty = 2, col = "grey45")
+  missing_year_positions <- which(!years %in% observed_years)
+  if (length(missing_year_positions) > 0L) {
+    plot_range <- par("usr")
+    text(
+      missing_year_positions,
+      plot_range[4L] - 0.04 * diff(plot_range[3:4]),
+      labels = "No rate\ndata",
+      cex = 0.75,
+      col = "grey45",
+      adj = c(0.5, 1)
+    )
+  }
+  legend(
+    "topright",
+    legend = c("General population", "Skin release"),
+    fill = c("grey80", colour),
+    bty = "n",
+    cex = 0.95
+  )
 }
-
-old_par <- par(mfrow = c(1, 3), mar = c(5, 4, 3, 1), oma = c(0, 0, 1, 0))
-plot_compact_delta_panel("Win rate", "#9ecae1")
-plot_compact_delta_panel("Pick rate", "#a1d99b")
-plot_compact_delta_panel("Ban rate", "#fdae6b")
-par(old_par)
 ```
+
+```{r}
+#| label: win-rate-delta-boxplot
+#| fig-cap: "Win-rate changes from 28 days before to 14 days after the anchor, by year."
+#| fig-width: 7
+#| fig-height: 5.5
+plot_delta_boxplot_by_year("Win rate", "#9ecae1")
+```
+
+```{r}
+#| label: pick-rate-delta-boxplot
+#| fig-cap: "Pick-rate changes from 28 days before to 14 days after the anchor, by year."
+#| fig-width: 7
+#| fig-height: 5.5
+plot_delta_boxplot_by_year("Pick rate", "#a1d99b")
+```
+
+```{r}
+#| label: ban-rate-delta-boxplot
+#| fig-cap: "Ban-rate changes from 28 days before to 14 days after the anchor, by year."
+#| fig-width: 7
+#| fig-height: 5.5
+plot_delta_boxplot_by_year("Ban rate", "#fdae6b")
+```
+
+The performance histories begin on 11 March 2014. Consequently, very early 2014 releases without both the required
+28-day pre-release and 14-day post-release observations are excluded automatically rather than extrapolated.
 
 Across all years, eligible skin releases have a mean win-rate delta of
 `r sprintf("%+.3f", mean_metric_delta("Win rate", "Skin release"))` percentage points, compared with
@@ -336,11 +449,11 @@ The pick- and ban-rate increases are consistent with players paying more attenti
 release. They do not, by themselves, distinguish a skin effect from promotion, concurrent game changes, or selection
 of champions whose popularity was already moving.
 
-### Same-champion controls and popularity
+### Same-champion controls and statistical tests
 
-The strongest current win-rate comparison matches every usable skin release to a different patch date for the same
-champion. A control's complete measurement interval is prohibited from overlapping another skin-release window. This
-holds fixed the champion without adding hundreds of sparsely observed champion indicator coefficients.
+The confirmatory comparison matches every usable skin release to a different patch date for the same champion. A
+control's complete measurement interval is prohibited from overlapping another skin-release window. This holds fixed
+the champion without adding hundreds of sparsely observed champion indicator coefficients.
 
 ```{r}
 #| label: win-rate-model-table
@@ -362,8 +475,160 @@ setcolorder(model_effect_display, c("Model", "Estimated effect (pp)", "95% CI", 
 knitr::kable(model_effect_display, digits = 3)
 ```
 
-The year-adjusted estimate remains close to zero, and adding pre-window popularity does not materially change it.
-Pre-window popularity itself is negatively associated with the subsequent win-rate delta in this model, but that
+For all three outcomes, the table below adds a paired *t*-test. The null hypothesis is that a release's change and its
+matched same-champion control's change have a mean difference of zero. Unlike the win-rate regression above, these
+tests do not adjust for pre-window popularity; they are a direct paired comparison of the matched deltas.
+
+```{r}
+#| label: paired-performance-tests-table
+#| tbl-cap: "Paired tests of skin-release deltas versus same-champion control deltas."
+paired_test_display <- copy(same_champion_performance_delta_tests)
+paired_test_display[, `95% CI` := sprintf(
+  "%.3f to %.3f",
+  confidence_interval_lower,
+  confidence_interval_upper
+)]
+paired_test_display[, p_value := vapply(p_value, format_p_value, character(1L))]
+paired_test_display[, c("confidence_interval_lower", "confidence_interval_upper") := NULL]
+setnames(
+  paired_test_display,
+  c("metric", "matched_pairs", "mean_delta_difference", "p_value"),
+  c("Metric", "Matched pairs", "Mean difference (pp)", "p-value")
+)
+setcolorder(
+  paired_test_display,
+  c("Metric", "Matched pairs", "Mean difference (pp)", "95% CI", "p-value")
+)
+knitr::kable(paired_test_display, digits = 3, format.args = list(big.mark = ","))
+```
+
+The paired test and the year-adjusted win-rate model agree: there is no evidence of a systematic win-rate increase.
+In contrast, pick and ban rates increase significantly relative to matched same-champion control dates.
+
+The following models apply the same calendar-year and pre-window-popularity adjustment used for win rate to pick- and
+ban-rate deltas. For pick rate, the popularity covariate is also the pre-window pick rate, so it serves as a baseline
+adjustment as well as a measure of prior popularity.
+
+```{r}
+#| label: adjusted-pick-ban-model-table
+#| tbl-cap: "Estimated skin-release effects on pick- and ban-rate deltas under same-champion control models."
+pick_ban_effect_display <- copy(same_champion_pick_ban_rate_effects)
+pick_ban_effect_display[, `95% CI` := sprintf(
+  "%.3f to %.3f",
+  confidence_interval_lower,
+  confidence_interval_upper
+)]
+pick_ban_effect_display[, p_value := vapply(p_value, format_p_value, character(1L))]
+pick_ban_effect_display[, c("confidence_interval_lower", "confidence_interval_upper") := NULL]
+setnames(
+  pick_ban_effect_display,
+  c("metric", "adjustment", "observations", "estimate", "p_value"),
+  c("Metric", "Adjustment", "Observations", "Estimated effect (pp)", "p-value")
+)
+setcolorder(pick_ban_effect_display, c(
+  "Metric", "Adjustment", "Observations", "Estimated effect (pp)", "95% CI", "p-value"
+))
+knitr::kable(pick_ban_effect_display, digits = 3, format.args = list(big.mark = ","))
+```
+
+The estimates are nearly unchanged when popularity is added: the adjusted effect is +1.150 percentage points for pick
+rate and +0.564 for ban rate. This strengthens the interpretation of a post-release attention effect, but it remains
+observational: a skin launch can coincide with promotion, game changes, and demand for a champion rather than
+independently causing those changes.
+
+### Does the association differ by skin type or Prestige status?
+
+This exploratory extension gives each matched control the price group and Prestige status of its paired skin release.
+Exact RP bands are retained in the descriptive table above, but the effect models combine the sparse bands into
+lower-priced RP tiers (390–975 RP), Epic (1,350 RP), premium RP tiers (1,820 RP or more), and non-standard or missing
+prices. A skin is classed as Prestige when its display name contains the word “Prestige”; this is a reproducible name
+inference, not a dedicated source-data field.
+
+```{r}
+#| label: skin-type-matched-cohort-table
+#| tbl-cap: "Usable same-champion skin-release pairs by modelled price group and inferred Prestige status."
+skin_type_cohort_display <- copy(skin_type_matched_cohort_counts)
+setnames(
+  skin_type_cohort_display,
+  c("skin_type", "prestige_group", "usable_skin_releases", "champions"),
+  c("Price group", "Prestige status", "Usable releases", "Champions")
+)
+knitr::kable(skin_type_cohort_display, format.args = list(big.mark = ","))
+```
+
+The sparse structure is important: all inferred Prestige releases in the usable cohort have non-standard or missing
+RP prices. Therefore, price-group and Prestige results are estimated in separate models; neither should be interpreted
+as holding the other characteristic fixed.
+
+Ultimate skins are especially scarce, so they are excluded from the subgroup tests. The figure below instead shows
+their individual after-minus-before changes alongside the matched same-champion control. It is descriptive: it does
+not estimate an Ultimate-skin effect or support a significance claim.
+
+```{r}
+#| label: ultimate-skin-rate-changes-figure
+#| fig-cap: "Individual rate changes around usable Ultimate-skin releases and their matched same-champion controls. Each bar is the interpolated value 14 days after its anchor minus the value 28 days before it."
+#| fig-width: 7
+#| fig-height: 9
+old_par <- par(mfrow = c(3, 1), mar = c(8, 5, 3, 1))
+plot_ultimate_skin_rate_changes("Win rate", "#3182bd")
+plot_ultimate_skin_rate_changes("Pick rate", "#238b45")
+plot_ultimate_skin_rate_changes("Ban rate", "#e6550d")
+par(old_par)
+```
+
+```{r}
+#| label: skin-type-interaction-tests-table
+#| tbl-cap: "Global tests of whether the matched skin-release effect differs by price group or inferred Prestige status."
+skin_type_interaction_display <- copy(same_champion_skin_type_interaction_tests)
+skin_type_interaction_display[, interaction_p_value := vapply(
+  interaction_p_value,
+  format_p_value,
+  character(1L)
+)]
+setnames(
+  skin_type_interaction_display,
+  c("metric", "modifier", "usable_skin_releases", "interaction_p_value"),
+  c("Metric", "Characteristic", "Usable releases", "Interaction p-value")
+)
+knitr::kable(skin_type_interaction_display, format.args = list(big.mark = ","))
+```
+
+```{r}
+#| label: skin-type-effects-table
+#| tbl-cap: "Adjusted same-champion skin-release effects within each price group and inferred Prestige status."
+skin_type_effect_display <- copy(same_champion_skin_type_effects)
+skin_type_effect_display[, `95% CI` := sprintf(
+  "%.3f to %.3f",
+  confidence_interval_lower,
+  confidence_interval_upper
+)]
+skin_type_effect_display[, p_value := vapply(p_value, format_p_value, character(1L))]
+skin_type_effect_display[, c("confidence_interval_lower", "confidence_interval_upper", "interaction_p_value") := NULL]
+setnames(
+  skin_type_effect_display,
+  c("metric", "modifier", "group", "usable_skin_releases", "estimated_skin_release_effect", "p_value"),
+  c("Metric", "Characteristic", "Group", "Usable releases", "Estimated effect (pp)", "p-value")
+)
+setcolorder(skin_type_effect_display, c(
+  "Metric", "Characteristic", "Group", "Usable releases", "Estimated effect (pp)", "95% CI", "p-value"
+))
+knitr::kable(skin_type_effect_display, digits = 3, format.args = list(big.mark = ","))
+```
+
+There is no evidence that either price group or inferred Prestige status changes the win-rate result (interaction
+*p* = `r format_p_value(same_champion_skin_type_interaction_tests[metric == "Win rate" & modifier == "Price group", interaction_p_value])`
+and `r format_p_value(same_champion_skin_type_interaction_tests[metric == "Win rate" & modifier == "Prestige status", interaction_p_value])`, respectively).
+Price groups do modify the post-release attention pattern: the global interaction tests are
+*p* = `r format_p_value(same_champion_skin_type_interaction_tests[metric == "Pick rate" & modifier == "Price group", interaction_p_value])`
+for pick rate and *p* = `r format_p_value(same_champion_skin_type_interaction_tests[metric == "Ban rate" & modifier == "Price group", interaction_p_value])`
+for ban rate. The premium group has the largest estimated increases (+2.752 percentage points in pick rate and +2.703
+in ban rate), whereas Epic releases show +0.960 and +0.349, respectively. This is an association, not evidence that a
+more expensive skin independently causes player attention: price, special currency, Prestige status, event promotion,
+and the selection of champions are intertwined. The inferred Prestige interactions themselves are not statistically
+detectable for win, pick, or ban rate.
+
+The year-adjusted win-rate estimate remains close to zero, and adding pre-window popularity does not materially change
+it. Pre-window popularity itself is negatively associated with the subsequent win-rate delta in this model, but that
 coefficient is observational and may reflect mean reversion or balance responses to popular champions. It does not
 support the idea that popularity-driven skin economics produces a detectable short-term win-rate increase.
 
@@ -372,7 +637,8 @@ support the idea that popularity-driven skin economics produces a detectable sho
 The clearest result is about **attention**, not favorable treatment. Champions close to a skin release appear in patch
 notes more often. Once attention is observed, however, the buff/nerf mix is not convincingly different, and neither the
 broad nor the same-champion comparison detects an average win-rate increase. Pick and ban rates rise after skin
-releases, suggesting that cosmetic launches coincide with increased player interest even when win rate stays stable.
+releases relative to same-champion control dates, suggesting that cosmetic launches coincide with increased player
+interest even when win rate stays stable.
 
 This distinction matters. “The balance team looks at champions receiving skins” is compatible with the data.
 “Champions are made stronger to sell skins” is not established by the current results.
@@ -391,11 +657,11 @@ The following additions would contribute more than another descriptive chart:
 3. **Placebo and permutation checks.** Assign matched pseudo-release dates to the same champions and repeat the complete
    pipeline. This would show how often effects as large as the observed ones arise from champion selection and calendar
    structure alone.
-4. **Matched analyses for pick and ban rates.** Their descriptive increases are much larger than the win-rate change,
-   but they should receive the same same-champion and popularity-adjusted treatment before being framed as effects.
-5. **Skin-level heterogeneity.** Price tier, prestige status, event promotion, simultaneous skin-line launches, and
-   multiple skins for one champion on the same date may separate major commercial releases from routine catalogue
-   additions.
+4. **Skin-level heterogeneity.** The recognized RP price-band mapping above is a reproducible first split. Prestige
+   status is currently inferred from the display name; a dedicated source field and event-promotion field would make
+   the price/Prestige comparison substantially more credible. Availability, loot eligibility, skin-set membership,
+   simultaneous skin-line launches, and multiple skins for one champion on the same date are useful additional
+   release-level features.
 
 Of these, the event study plus placebo dates would be the most informative next step: it would turn the current
 before/after snapshot into a time-resolved test while keeping the comparison within champion.
@@ -426,6 +692,7 @@ SELECT
   skins.wiki_skin_id AS skin_id,
   skins.display_name AS skin_name,
   skins.release_date AS skin_release_date,
+  skins.cost AS skin_cost,
   base_skin.release_date AS champion_release_date
 FROM skins
 JOIN champions ON champions.id = skins.champion_id
