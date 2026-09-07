@@ -1,185 +1,40 @@
 # League of Legends skin release statistics
 
-This project will build a local, reproducible dataset for analysing relationships between champion skins, champion performance, and balance changes over time.
+Do champions receive favourable balance treatment when they get a new skin? This project collects League of Legends skin releases, patch histories, and player-performance histories to examine that question.
 
-The first stage is data collection and normalization. Analysis and visualisation should be built only after the source data can be reproduced reliably.
+It contains a reproducible data-collection pipeline, a populated SQLite database, and the rendered analysis. The current dataset snapshot is from 6 September 2026.
 
-## Stage 1 scope
+> [!IMPORTANT]
+> ## Explore the database
+>
+> The ready-to-query [SQLite database](data/lol_skin_release_statistics.sqlite3) is the most useful artifact in this repository. It is a 44 MB snapshot containing 173 champions, 2,130 skin records (1,957 non-base skins), 466 patches, 34,047 patch-note entries, 11,855 champion-patch classifications, and 140,054 win-, pick-, and ban-rate observations.
+>
+> It includes normalized tables as well as cached League Wiki source documents, so it can be used as a starting point for different analyses without rerunning the collectors. See the [data model](docs/db_data_model.md) for its tables and relationships.
 
-Collect the following data for every League of Legends champion:
+## What is included
 
-1. Historical performance measurements from the charts on [League of Graphs](https://www.leagueofgraphs.com/champions/stats), especially:
+- League Wiki collector for champion identities, skin metadata and release dates, patch histories, patch dates, and hotfix dates.
+- Offline importer for manually saved League of Graphs pages, containing historical win rate, pick rate, and ban rate.
+- Champion-patch classifier, which assigns each aggregate patch change a `buff`, `nerf`, `change`, or `rework` label.
+- SQLite database and source-data provenance.
+- Quarto/R analysis source, rendered HTML, and rendered PDF.
 
-   - win rate;
-   - popularity/pick rate;
-   - ban rate;
-   - the timestamp associated with every point.
+League of Graphs pages are deliberately imported from manually saved HTML. The project does not download them automatically because the site's Terms of Use prohibit automated extraction without permission.
 
-2. Every skin and its release date from the champion's Wiki [Cosmetics page](https://wiki.leagueoflegends.com/en-us/Ashe/Cosmetics).
-3. The champion's complete [League of Legends Wiki](https://wiki.leagueoflegends.com/en-us/Ashe/Patch_history) patch history.
-4. The release/effective date of every referenced patch and hotfix.
-5. One classification of each champion's overall change in a patch as a `buff`, `nerf`, `change`, or `rework`.
+## Read or run the project
 
-## Proposed pipeline
+- [Data collection guide](docs/data-collection.md) — setup, complete rebuild, source constraints, importer, and patch classification.
+- [Analysis rendering guide](docs/quarto.md) — prerequisites and commands to render the Quarto report as HTML or PDF.
+- [Database data model](docs/db_data_model.md) — tables, fields, and entity-relationship diagram.
 
-```text
-source champion lists
-        │
-        ▼
-canonical champion registry + source-specific aliases/URLs
-        │
-        ├── League of Graphs charts ──► timestamped performance points ─┐
-        ├── Wiki SkinData ────────────► skins + release dates ──────────┤
-        └── Wiki patch histories ─────► patch entries + patch dates     │
-                                                    │                   │
-                                                    ▼                   │
-                         champion-patch LiteLLM classification ────┤
-                                                                        ▼
-                                                                 local SQLite DB
-```
+## Analysis
 
-### 1. Discover champions from the sources
+Read the full report: [PDF](src/analysis/skin_release_findings.pdf) · [Quarto source](src/analysis/skin_release_findings.qmd)
 
-Do not construct URLs by lower-casing champion names. Discover and persist the links published by each source instead:
+The analysis considers 1,377 eligible skin releases since 2014, excluding releases close to a champion launch or major rework. Its main results are:
 
-- Wiki: [List of champions](https://wiki.leagueoflegends.com/en-us/List_of_champions)
-- League of Graphs: [Win rate by experience](https://www.leagueofgraphs.com/champions/winrates-by-xp) or the champion selector on a stats page
+- Champions near a skin release appear in patch notes more often: the estimated odds are 24% higher.
+- There is no convincing evidence that those patch-note appearances are more likely to be buffs than nerfs, or that win rate rises after a release.
+- Pick and ban rates do increase after a release, consistent with increased player attention.
 
-This handles source-specific identifiers and renames. For example, the Wiki uses `Wukong`, while League of Graphs uses the `monkeyking` slug. Other names contain spaces, apostrophes, ampersands, abbreviations, or shortened slugs.
-
-The database should keep a stable internal champion ID alongside the display name and every source-specific identifier. Newly released or renamed champions can then be added without changing historical rows.
-
-### 2. Extract performance histories
-
-League of Graphs' champion stats pages render the historical charts from JavaScript arrays of `[Unix timestamp in milliseconds, value]` pairs. Separate arrays exist for popularity, win rate, and ban rate. The data is therefore more precise than reading pixels or chart tooltips.
-
-Each series must retain the champion identity and source provenance, including the source URL and saved HTML file.
-Role, rank bracket, region, queue, and game-mode filters are intentionally not normalized or stored. The timestamps
-are observations rather than patch identifiers, so they should be stored as-is and joined to the patch calendar later.
-
-#### Access constraint
-
-[League of Graphs' Terms of Use](https://www.leagueofgraphs.com/terms-of-use) prohibit automated queries and scraping without express written permission. Direct non-browser requests are also currently protected by a Cloudflare challenge. Although archived HTML confirms that the chart arrays are technically extractable, an automated collector should **not** be implemented or run until either:
-
-- League of Graphs grants written permission; or
-- a licensed/authorized replacement source is selected.
-
-If permission is obtained, the extractor should use conservative request rates, caching, an identifiable user agent, retries with backoff, and raw-response hashes. It should not attempt to bypass CAPTCHAs or other access controls.
-
-A Selenium-controlled browser is a technically suitable implementation after permission is obtained: it can load the normal champion stats page and read the embedded JavaScript arrays from the DOM. It should use a single browser/session, a single worker, long jittered delays, persistent caching, and resumable checkpoints. Slow browser automation is still an automated query under the current Terms, however, so human-like timing alone does not remove the permission requirement.
-
-### 3. Extract skins and release dates
-
-The rendered `<Champion>/Cosmetics` pages contain one card per base skin with its internal name, display name, price, release date, availability group, and Wiki file link for the splash image. Chromas are nested under their base skin and should not be counted as independent skin releases.
-
-The cleaner source is the Wiki's [`Module:SkinData/data`](https://wiki.leagueoflegends.com/en-us/Module:SkinData/data), which generates those pages. It provides all champions in one structured Lua data table, including:
-
-- champion and skin IDs;
-- internal and formatted skin names;
-- ISO-formatted release dates;
-- availability, price, loot eligibility, and retirement dates;
-- skin sets and optional feature flags;
-- chroma IDs and availability metadata;
-- optional lore, artists, voice actors, and related metadata.
-
-Fetch and archive this module through the MediaWiki API, then parse it in Python. The rendered Cosmetics page can be used as a validation/fallback source and to resolve its published splash-art file link. Include the `Original` skin but mark it explicitly as the champion's base skin so analyses can include or exclude it deliberately.
-
-The initial dataset needs skin metadata and the source Cosmetics-page URL. If local image files are useful later, resolve and download the canonical Wiki file separately and store its content hash and local path; the images themselves are not required for release-date analysis.
-
-### 4. Extract patch histories and dates
-
-The Wiki is backed by MediaWiki and exposes parsed HTML and wikitext through its API. The intended inputs are:
-
-- `List_of_champions` for canonical Wiki champion pages;
-- `<Champion>/Patch_history` for the expanded per-champion history;
-- each referenced patch page, such as `V13.12`, for its `Release Date (US)` value.
-
-A patch history is already structured as patch heading → ability/stat context → individual change entries. Store each leaf change separately while retaining its parent context and source order. Hotfix labels such as `V12.5 - March 9th Hotfix` need their own effective date in addition to the base patch release date.
-
-Raw source text should be retained. The parser can then be improved without refetching the source, and every normalized entry remains auditable.
-
-### 5. Classify champion-patch balance changes
-
-Send all normalized patch notes for one champion and patch—not a whole champion history—to the configured model through LiteLLM and request a strict structured response with one label:
-
-- `buff`: increases the champion's power or usability;
-- `nerf`: decreases the champion's power or usability;
-- `change`: neutral, mixed, mechanical, cosmetic, or bug-fix-only change;
-- `rework`: belongs to an explicit, broad champion gameplay overhaul or relaunch that substantially replaces mechanics across the kit.
-
-Use `rework` conservatively. A large ordinary balance patch, initial champion release, visual update, or smaller mid-scope adjustment is not automatically a rework. The classifier receives every patch heading, hotfix, ability/stat context, and individual change for the champion-patch, then judges their aggregate effect. Material buffs and nerfs with no clear net direction are classified as `change`.
-
-Keep classification output separate from the extracted fact. The shared database only needs the label, worded confidence, and classification time. LiteLLM connection details, model identifiers, prompts, request metadata, and raw responses remain process-only and are not persisted.
-
-Classification runs through 12 worker processes by default and displays a `tqdm` progress bar. Workers perform only
-the LiteLLM requests; the parent process serializes SQLite writes so interrupted runs remain safely resumable.
-
-## Planned SQLite model
-
-The normalized database will live locally, for example at `data/lol_skin_release_statistics.sqlite3`.
-
-| Table | Purpose |
-| --- | --- |
-| `champions` | Stable champion identity and canonical display name |
-| `champion_source_ids` | Wiki titles/URLs, League of Graphs slugs/URLs, and aliases |
-| `source_documents` | Retrieval metadata, content hash, and raw source payload |
-| `graph_series` | Champion metric plus the saved HTML file, canonical source URL, modification time, and content hash |
-| `graph_points` | Timestamp/value observations belonging to a graph series |
-| `patches` | Patch identifier, release date, and source URL |
-| `patch_events` | Champion-specific patch/hotfix headings, effective dates, and source order |
-| `patch_entries` | Champion, patch, context, individual change text, and source order |
-| `patch_classifications` | Shareable classification label, worded confidence, and timestamp for each champion-patch |
-| `skins` | Skin ID/name, base-skin flag, release/retirement dates, availability, price, and source URLs |
-| `skin_chromas` | Chroma IDs and availability, linked to their base skin |
-
-Important constraints should prevent duplicate source identifiers, duplicate points within a series, and duplicate patch entries from repeated imports. Imports should be transactional and idempotent.
-
-The implemented tables and relationships are shown in the [database ERD](docs/db_data_model.md).
-
-## Render the analysis article
-
-With the populated SQLite database available under `data/`, render the HTML article from the repository root with:
-
-```bash
-quarto render src/analysis/skin_release_findings.qmd --to html
-```
-
-To create a PDF instead, run:
-
-```bash
-quarto render src/analysis/skin_release_findings.qmd --to pdf
-```
-
-The rendered files are written beside the source as `src/analysis/skin_release_findings.html` or
-`src/analysis/skin_release_findings.pdf`. The report uses `tmp.R` as its hidden analysis source, so that scratch file
-must also be present when rendering. See the [Quarto guide](docs/quarto.md) for setup, preview, and troubleshooting.
-
-## Extraction approach
-
-The extraction code will be written in Python. A small HTTP client plus an HTML parser is sufficient for the Wiki; SQLite support is included in Python's standard library. Network and parser dependencies should be kept minimal and pinned once implementation begins.
-
-The collectors should:
-
-- identify themselves with a descriptive user agent;
-- respect source terms and access controls;
-- rate-limit and cache requests;
-- retry transient failures with exponential backoff;
-- validate expected page structure before writing rows;
-- record retrieval times, source URLs, and content hashes;
-- preserve raw data and normalized data separately;
-- upsert deterministically so reruns do not create duplicates.
-
-## Investigation status
-
-- [x] Confirmed that the Wiki champion list can provide canonical champion URLs.
-- [x] Confirmed that expanded Wiki patch histories and patch release dates are available through the MediaWiki API.
-- [x] Confirmed that Wiki skin metadata and ISO release dates are available from `Module:SkinData/data`.
-- [x] Confirmed that rendered Cosmetics pages provide skin cards and splash-art file links.
-- [x] Confirmed that League of Graphs chart values are embedded as timestamp/value arrays rather than only rendered pixels.
-- [x] Confirmed the `Wukong` ↔ `monkeyking` naming inconsistency and the need for source-specific mappings.
-- [ ] Obtain League of Graphs scraping permission or choose an authorized historical-statistics source.
-- [x] Implement the Python Wiki collector and SQLite schema (see [data collection instructions](docs/data-collection.md)).
-- [x] Implement the resumable LiteLLM classification step (see [data collection instructions](docs/data-collection.md)).
-- [x] Implement the offline importer for manually saved League of Graphs HTML pages.
-- [ ] Evaluate classification quality and refine the prompt using a reviewed sample.
-- [ ] Build downstream skin-release analyses.
+In short, the data supports “champions get more attention when they receive a skin,” but does not establish “Riot makes champions stronger to sell skins.” This is an observational analysis, so it shows association rather than causation.
