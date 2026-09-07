@@ -136,6 +136,24 @@ Important constraints should prevent duplicate source identifiers, duplicate poi
 
 The implemented tables and relationships are shown in the [database ERD](docs/db_data_model.md).
 
+## Render the analysis article
+
+With the populated SQLite database available under `data/`, render the HTML article from the repository root with:
+
+```bash
+quarto render src/analysis/skin_release_findings.qmd --to html
+```
+
+To create a PDF instead, run:
+
+```bash
+quarto render src/analysis/skin_release_findings.qmd --to pdf
+```
+
+The rendered files are written beside the source as `src/analysis/skin_release_findings.html` or
+`src/analysis/skin_release_findings.pdf`. The report uses `tmp.R` as its hidden analysis source, so that scratch file
+must also be present when rendering. See the [Quarto guide](docs/quarto.md) for setup, preview, and troubleshooting.
+
 ## Extraction approach
 
 The extraction code will be written in Python. A small HTTP client plus an HTML parser is sufficient for the Wiki; SQLite support is included in Python's standard library. Network and parser dependencies should be kept minimal and pinned once implementation begins.

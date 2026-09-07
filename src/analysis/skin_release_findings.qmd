@@ -1,0 +1,500 @@
+---
+title: "Do skin releases coincide with favorable champion treatment?"
+subtitle: "Patch-note attention, balance direction, and player response"
+format:
+  html:
+    toc: true
+    embed-resources: true
+    code-fold: false
+execute:
+  echo: false
+  warning: false
+  message: false
+  error: false
+---
+
+## The question
+
+League of Legends players sometimes suspect that champions are buffed around a skin release. There are at least three
+different claims hidden inside that suspicion:
+
+1. Champions receiving a skin may be more likely to appear in the patch notes.
+2. When they do appear, their changes may be more likely to be buffs than nerfs.
+3. Whatever happens in the patch notes may translate into better in-game performance.
+
+Those claims require different comparisons. This article follows them in order, moving from balance-team attention to
+the direction of classified changes and finally to observed win, pick, and ban rates.
+
+The result is more nuanced than “skins cause buffs.” Champions near a skin release do receive more patch-note
+attention. However, the evidence does not show a reliable shift toward buffs or an increase in win rate. What changes
+most clearly after a release is player attention: pick and ban rates rise.
+
+## Analysis design
+
+The current analysis uses the following parameters. These are the only non-SQL implementation details shown in the
+article; the R code that constructs tables, tests, and figures is hidden from the rendered output.
+
+```{r}
+#| label: analysis-parameters
+#| echo: true
+#| eval: false
+skin_release_cutoff_year <- 2013L
+skin_patch_window_days <- 42L
+champion_release_window_days <- 60L
+rework_window_days <- 60L
+pre_performance_days <- 28L
+post_performance_days <- 14L
+```
+
+A skin is eligible when it was released in 2013 or later and is not within 60 days of either the champion's original
+release or a classified rework. Patch-note windows extend 42 days in both directions from an eligible skin release.
+Performance changes are measured as the interpolated value 14 days after an anchor minus the value 28 days before it.
+All rate changes are reported in percentage points.
+
+The unit of the patch-note analysis is a champion–patch opportunity: every champion available on a patch date either
+appears in that patch's notes or does not. The unit of the balance analysis is one aggregate classification for a
+champion in a patch. The performance analysis compares eligible skin releases with champion–patch dates outside every
+eligible skin-release window.
+
+```{r}
+#| label: load-scratch-analysis
+#| include: false
+scratch_candidates <- c("tmp.R", "../../tmp.R")
+scratch_file <- scratch_candidates[file.exists(scratch_candidates)][1L]
+if (is.na(scratch_file)) {
+  stop("Could not locate tmp.R from the project root or src/analysis.")
+}
+invisible(capture.output(source(scratch_file, local = knitr::knit_global())))
+
+format_p_value <- function(value) {
+  if (is.na(value)) {
+    return("NA")
+  }
+  if (value < 0.001) {
+    return(format(value, scientific = TRUE, digits = 3))
+  }
+  sprintf("%.3f", value)
+}
+
+appearance_odds_ratio <- unname(patch_note_appearance_cmh_test$estimate)
+appearance_confidence_interval <- unname(patch_note_appearance_cmh_test$conf.int)
+appearance_p_value <- patch_note_appearance_cmh_test$p.value
+
+buff_odds_ratio <- unname(buff_nerf_cmh_test$estimate)
+buff_confidence_interval <- unname(buff_nerf_cmh_test$conf.int)
+buff_p_value <- buff_nerf_cmh_test$p.value
+
+mean_metric_delta <- function(metric_label, group_label) {
+  performance_deltas_long[
+    metric == metric_label & comparison_group == group_label,
+    mean(delta)
+  ]
+}
+```
+
+### From all skins to the analysis cohort
+
+```{r}
+#| label: cohort-table
+#| tbl-cap: "Skin-release cohort construction."
+cohort_display <- copy(skin_cohort_counts)
+setnames(cohort_display, c("Cohort", "Skin releases"))
+knitr::kable(cohort_display, format.args = list(big.mark = ","))
+```
+
+The cutoff removes the unusually dense early years, while the release/rework exclusion avoids treating the launch of a
+new champion or a major redesign as an ordinary skin event.
+
+```{r}
+#| label: cohort-by-year-figure
+#| fig-cap: "Total and eligible skin releases by year after the analysis cutoff."
+#| fig-width: 10
+#| fig-height: 5.5
+plot(
+  final_skin_releases_since_cutoff$release_year,
+  final_skin_releases_since_cutoff$total_skin_releases,
+  type = "b",
+  pch = 16,
+  col = "#9e9e9e",
+  ylim = range(c(
+    final_skin_releases_since_cutoff$total_skin_releases,
+    final_skin_releases_since_cutoff$skin_releases_considered
+  )),
+  xlab = "Release year",
+  ylab = "Skin releases",
+  main = "Skin releases available to the analysis"
+)
+lines(
+  final_skin_releases_since_cutoff$release_year,
+  final_skin_releases_since_cutoff$skin_releases_considered,
+  type = "b",
+  pch = 16,
+  col = "#238b45"
+)
+legend(
+  "topleft",
+  legend = c("All releases", "Eligible releases"),
+  col = c("#9e9e9e", "#238b45"),
+  pch = 16,
+  lty = 1,
+  bty = "n"
+)
+```
+
+Skin releases are not evenly distributed across champions. The champions with the largest catalogues are also a useful
+warning about confounding: commercially prominent champions recur throughout the data.
+
+```{r}
+#| label: leading-champions-table
+#| tbl-cap: "Champions with the most dated non-base skin releases (top 10 by overall count)."
+leading_champions <- head(copy(top_20_champions_by_skin_releases), 10L)
+setnames(
+  leading_champions,
+  c("champion_id", "champion_name", "overall_skin_releases", "skins_since_cutoff"),
+  c("Champion ID", "Champion", "All releases", "Releases since cutoff")
+)
+knitr::kable(leading_champions, format.args = list(big.mark = ","))
+```
+
+## Finding 1: skin releases coincide with more patch-note attention
+
+Champions within a skin-release window appeared in the patch notes more often than other available champions. The
+overall rates are shown below; the annual plot matters because both the champion roster and Riot's patch philosophy
+changed over time.
+
+```{r}
+#| label: appearance-rate-table
+#| tbl-cap: "Patch-note appearances among champion–patch opportunities."
+appearance_display <- copy(patch_note_appearance_rates_overall)
+appearance_display[, appearance_rate := sprintf("%.1f%%", 100 * appearance_rate)]
+setnames(
+  appearance_display,
+  c(
+    "skin_release_window",
+    "champion_patch_opportunities",
+    "patch_note_appearances",
+    "appearance_rate"
+  ),
+  c("Skin-release window", "Opportunities", "Appearances", "Appearance rate")
+)
+knitr::kable(appearance_display, format.args = list(big.mark = ","))
+```
+
+```{r}
+#| label: appearance-rate-figure
+#| fig-cap: "Annual patch-note appearance rates for champions within and outside eligible skin-release windows."
+#| fig-width: 10
+#| fig-height: 5.5
+appearance_plot_data <- dcast(
+  patch_note_appearance_rates_by_year,
+  patch_year ~ skin_release_window,
+  value.var = "appearance_rate"
+)
+matplot(
+  appearance_plot_data$patch_year,
+  100 * as.matrix(appearance_plot_data[, .(
+    `No nearby skin release`,
+    `Within skin-release window`
+  )]),
+  type = "b",
+  pch = c(16, 17),
+  lty = 1,
+  col = c("#636363", "#2b8cbe"),
+  xlab = "Patch year",
+  ylab = "Patch-note appearance rate (%)",
+  main = "Champions near skin releases receive more patch-note attention"
+)
+legend(
+  "topleft",
+  legend = c("No nearby skin release", "Within skin-release window"),
+  col = c("#636363", "#2b8cbe"),
+  pch = c(16, 17),
+  lty = 1,
+  bty = "n"
+)
+```
+
+A Mantel–Haenszel test stratified by patch year estimates a common odds ratio of
+`r sprintf("%.2f", appearance_odds_ratio)` (95% CI
+`r sprintf("%.2f–%.2f", appearance_confidence_interval[1L], appearance_confidence_interval[2L])`,
+*p* = `r format_p_value(appearance_p_value)`). In other words, after accounting for year, the odds of appearing in
+the patch notes are about `r sprintf("%.0f%%", 100 * (appearance_odds_ratio - 1))` higher within a skin-release
+window.
+
+This is strong evidence of an association, but it is not evidence that a skin release causes balance attention.
+Champions chosen for skins may already be more popular, more actively maintained, or otherwise more likely to need a
+change.
+
+## Finding 2: the extra attention is not clearly more favorable
+
+More patch-note appearances do not necessarily mean more buffs. Among champion–patch classifications labeled as a
+buff or nerf, the observed buff-to-nerf ratio is somewhat higher near skin releases.
+
+```{r}
+#| label: buff-nerf-table
+#| tbl-cap: "Buff and nerf classifications from the cutoff year onward."
+balance_display <- copy(buff_nerf_balance_by_skin_window)
+balance_display[, buff_share := buffs / (buffs + nerfs)]
+balance_display[, buff_share := sprintf("%.1f%%", 100 * buff_share)]
+balance_display[, buff_to_nerf_ratio := sprintf("%.2f", buff_to_nerf_ratio)]
+setnames(
+  balance_display,
+  c("skin_release_window", "buffs", "nerfs", "buff_to_nerf_ratio", "buff_share"),
+  c("Skin-release window", "Buffs", "Nerfs", "Buff-to-nerf ratio", "Buff share")
+)
+knitr::kable(balance_display, format.args = list(big.mark = ","))
+```
+
+The year-stratified Mantel–Haenszel test estimates a buff odds ratio of
+`r sprintf("%.2f", buff_odds_ratio)` (95% CI
+`r sprintf("%.2f–%.2f", buff_confidence_interval[1L], buff_confidence_interval[2L])`,
+*p* = `r format_p_value(buff_p_value)`). The point estimate leans in the suspected direction, but the confidence
+interval includes no difference. The data therefore do not provide convincing evidence that the additional attention
+near skin releases is systematically more buff-oriented.
+
+## Finding 3: win rate is stable, while pick and ban rates rise
+
+For every performance observation, the delta is the interpolated rate 14 days after the anchor minus the rate 28 days
+before it. Positive values represent an increase. The broad comparison population consists of champion–patch dates
+outside eligible skin-release windows.
+
+```{r}
+#| label: performance-delta-table
+#| tbl-cap: "Mean performance changes from 28 days before to 14 days after the anchor."
+performance_delta_display <- performance_deltas_long[, .(
+  Observations = .N,
+  `Mean delta (pp)` = mean(delta),
+  `Median delta (pp)` = median(delta)
+), by = .(
+  Metric = metric,
+  Group = comparison_group
+)][order(Metric, Group)]
+knitr::kable(performance_delta_display, digits = 3, format.args = list(big.mark = ","))
+```
+
+The yearly distributions tell the same broad story. Win-rate changes cluster around zero for both groups. Pick- and
+ban-rate changes are more dispersed, but skin releases tend to sit higher than the comparison population. Outlying
+points are suppressed in the figure so that the central distributions remain legible; they remain in every
+calculation.
+
+```{r}
+#| label: performance-delta-boxplots
+#| fig-cap: "Distributions of after-minus-before changes by anchor year. Grey boxes are the general population; colored boxes are eligible skin releases."
+#| fig-width: 16
+#| fig-height: 6.5
+plot_compact_delta_panel <- function(metric_label, colour) {
+  plot_data <- performance_deltas_long[metric == metric_label]
+  years <- sort(unique(plot_data$anchor_year))
+  year_positions <- seq_along(years)
+  box_positions <- as.vector(rbind(year_positions - 0.18, year_positions + 0.18))
+  box_values <- unlist(lapply(years, function(year) {
+    list(
+      plot_data[
+        anchor_year == year & comparison_group == "General population",
+        delta
+      ],
+      plot_data[
+        anchor_year == year & comparison_group == "Skin release",
+        delta
+      ]
+    )
+  }), recursive = FALSE)
+
+  boxplot(
+    box_values,
+    at = box_positions,
+    boxwex = 0.3,
+    col = rep(c("grey80", colour), length(years)),
+    border = "grey35",
+    outline = FALSE,
+    xaxt = "n",
+    xlab = "Anchor year",
+    ylab = "Change (pp)",
+    main = metric_label
+  )
+  axis(1, at = year_positions, labels = years, las = 2, cex.axis = 0.75)
+  abline(h = 0, lty = 2, col = "grey45")
+}
+
+old_par <- par(mfrow = c(1, 3), mar = c(5, 4, 3, 1), oma = c(0, 0, 1, 0))
+plot_compact_delta_panel("Win rate", "#9ecae1")
+plot_compact_delta_panel("Pick rate", "#a1d99b")
+plot_compact_delta_panel("Ban rate", "#fdae6b")
+par(old_par)
+```
+
+Across all years, eligible skin releases have a mean win-rate delta of
+`r sprintf("%+.3f", mean_metric_delta("Win rate", "Skin release"))` percentage points, compared with
+`r sprintf("%+.3f", mean_metric_delta("Win rate", "General population"))` in the broad comparison population.
+The corresponding mean deltas are
+`r sprintf("%+.2f", mean_metric_delta("Pick rate", "Skin release"))` versus
+`r sprintf("%+.2f", mean_metric_delta("Pick rate", "General population"))` percentage points for pick rate and
+`r sprintf("%+.2f", mean_metric_delta("Ban rate", "Skin release"))` versus
+`r sprintf("%+.2f", mean_metric_delta("Ban rate", "General population"))` for ban rate.
+
+The pick- and ban-rate increases are consistent with players paying more attention to a champion after a cosmetic
+release. They do not, by themselves, distinguish a skin effect from promotion, concurrent game changes, or selection
+of champions whose popularity was already moving.
+
+### Same-champion controls and popularity
+
+The strongest current win-rate comparison matches every usable skin release to a different patch date for the same
+champion. A control's complete measurement interval is prohibited from overlapping another skin-release window. This
+holds fixed the champion without adding hundreds of sparsely observed champion indicator coefficients.
+
+```{r}
+#| label: win-rate-model-table
+#| tbl-cap: "Estimated skin-release effect on the win-rate delta under same-champion control models."
+model_effect_display <- copy(same_champion_win_rate_effects)
+model_effect_display[, `95% CI` := sprintf(
+  "%.3f to %.3f",
+  confidence_interval_lower,
+  confidence_interval_upper
+)]
+model_effect_display[, p_value := vapply(p_value, format_p_value, character(1L))]
+model_effect_display[, c("confidence_interval_lower", "confidence_interval_upper") := NULL]
+setnames(
+  model_effect_display,
+  c("model", "estimate", "p_value"),
+  c("Model", "Estimated effect (pp)", "p-value")
+)
+setcolorder(model_effect_display, c("Model", "Estimated effect (pp)", "95% CI", "p-value"))
+knitr::kable(model_effect_display, digits = 3)
+```
+
+The year-adjusted estimate remains close to zero, and adding pre-window popularity does not materially change it.
+Pre-window popularity itself is negatively associated with the subsequent win-rate delta in this model, but that
+coefficient is observational and may reflect mean reversion or balance responses to popular champions. It does not
+support the idea that popularity-driven skin economics produces a detectable short-term win-rate increase.
+
+## What the evidence currently says
+
+The clearest result is about **attention**, not favorable treatment. Champions close to a skin release appear in patch
+notes more often. Once attention is observed, however, the buff/nerf mix is not convincingly different, and neither the
+broad nor the same-champion comparison detects an average win-rate increase. Pick and ban rates rise after skin
+releases, suggesting that cosmetic launches coincide with increased player interest even when win rate stays stable.
+
+This distinction matters. “The balance team looks at champions receiving skins” is compatible with the data.
+“Champions are made stronger to sell skins” is not established by the current results.
+
+## What would strengthen the article next
+
+The following additions would contribute more than another descriptive chart:
+
+1. **An event-study figure.** Plot weekly win, pick, and ban-rate differences from several weeks before to several
+   weeks after release, using same-champion placebo dates. This would reveal anticipation, short-lived launch spikes,
+   persistence, and mean reversion that a two-point delta cannot show.
+2. **A repeated-measures model for patch-note appearances.** The Mantel–Haenszel test controls for year but treats
+   recurring champion–patch opportunities approximately as independent. A mixed-effects model or clustered standard
+   errors by champion and patch would better reflect the data structure. Pre-window popularity, champion age, and
+   release cadence are natural covariates.
+3. **Placebo and permutation checks.** Assign matched pseudo-release dates to the same champions and repeat the complete
+   pipeline. This would show how often effects as large as the observed ones arise from champion selection and calendar
+   structure alone.
+4. **Matched analyses for pick and ban rates.** Their descriptive increases are much larger than the win-rate change,
+   but they should receive the same same-champion and popularity-adjusted treatment before being framed as effects.
+5. **Skin-level heterogeneity.** Price tier, prestige status, event promotion, simultaneous skin-line launches, and
+   multiple skins for one champion on the same date may separate major commercial releases from routine catalogue
+   additions.
+
+Of these, the event study plus placebo dates would be the most informative next step: it would turn the current
+before/after snapshot into a time-resolved test while keeping the comparison within champion.
+
+## Limitations
+
+- This is an observational analysis. Skin selection, balance attention, champion popularity, and marketing are jointly
+  determined.
+- The same champions and patches recur, so simple tests can understate uncertainty unless dependence is modeled.
+- Broad performance controls are anchored on patch dates, whereas treatment observations are anchored on exact skin
+  release dates.
+- Linear interpolation cannot recover short-lived movements between observations and does not extrapolate beyond a
+  champion series' observed range.
+- The classifier reduces all changes for one champion in one patch to a single label. That is the desired unit here,
+  but complex mixed changes inevitably lose detail.
+- The latest calendar year may be incomplete and should not be interpreted as a full-year total.
+
+## Data queries
+
+The analytical transformations are hidden, but the SQL that defines the source data remains visible for auditability.
+
+### Dated non-base skins
+
+```sql
+SELECT
+  champions.game_id AS champion_id,
+  champions.name AS champion_name,
+  skins.wiki_skin_id AS skin_id,
+  skins.display_name AS skin_name,
+  skins.release_date AS skin_release_date,
+  base_skin.release_date AS champion_release_date
+FROM skins
+JOIN champions ON champions.id = skins.champion_id
+JOIN skins AS base_skin
+  ON base_skin.champion_id = champions.id
+ AND base_skin.is_base = 1
+WHERE skins.is_base = 0
+  AND skins.release_date IS NOT NULL
+  AND skins.availability <> 'Canceled'
+ORDER BY skins.release_date, champions.name, skins.wiki_skin_id;
+```
+
+### Performance histories
+
+```sql
+SELECT
+  champions.game_id AS champion_id,
+  graph_series.metric,
+  graph_points.observed_at_ms,
+  graph_points.value
+FROM graph_points
+JOIN graph_series ON graph_series.id = graph_points.graph_series_id
+JOIN champions ON champions.id = graph_series.champion_id
+WHERE graph_series.metric IN ('win_rate', 'popularity', 'ban_rate')
+ORDER BY champions.game_id, graph_series.metric, graph_points.observed_at_ms;
+```
+
+### Aggregate champion–patch classifications
+
+```sql
+SELECT
+  champions.game_id AS champion_id,
+  patch_classifications.patch_id,
+  patches.release_date AS patch_release_date,
+  patch_classifications.label AS classification_label,
+  patch_classifications.confidence
+FROM patch_classifications
+JOIN champions ON champions.id = patch_classifications.champion_id
+JOIN patches ON patches.patch_id = patch_classifications.patch_id
+WHERE patch_classifications.label IN ('buff', 'nerf', 'rework');
+```
+
+### Champion and patch calendars
+
+```sql
+SELECT
+  champions.game_id AS champion_id,
+  champions.name AS champion_name,
+  base_skin.release_date AS champion_release_date
+FROM champions
+JOIN skins AS base_skin
+  ON base_skin.champion_id = champions.id
+ AND base_skin.is_base = 1
+WHERE base_skin.release_date IS NOT NULL;
+
+SELECT patch_id, release_date AS patch_release_date
+FROM patches
+WHERE release_date IS NOT NULL
+ORDER BY release_date, patch_id;
+```
+
+### Patch-note appearances
+
+```sql
+SELECT DISTINCT
+  champions.game_id AS champion_id,
+  patch_events.patch_id
+FROM patch_events
+JOIN champions ON champions.id = patch_events.champion_id
+JOIN patches ON patches.patch_id = patch_events.patch_id
+WHERE patches.release_date IS NOT NULL;
+```
